@@ -523,6 +523,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
     _SPLIT_THRESHOLD = 4000  # chunk near this length ⇒ a client-side split continuation is almost certain
     MEDIA_GROUP_WAIT_SECONDS = 0.8
+    # Upper bound on how long an album flush waits for sibling downloads still in flight before
+    # sending what it has — one wedged download must not hold the whole album forever.
+    MEDIA_GROUP_MAX_WAIT_SECONDS = 8.0
     HELD_INBOUND_MAX = 64  # inbound events held across a disconnect window; oldest dropped first
     _GENERAL_TOPIC_THREAD_ID = "1"
     # send() can race a disconnect blip; failing "Not connected" (retryable=False) parks the answer in the
@@ -625,6 +628,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._pending_photo_batch_tasks: dict[str, asyncio.Task] = {}
         self._media_group_events: dict[str, MessageEvent] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        # In-flight album-item counts per media_group_id: incremented on ARRIVAL (before the slow
+        # photo download), decremented on every exit path; the flush waits while > 0 so siblings
+        # still downloading cannot split the album into separate turns.
+        self._media_group_pending: dict[str, int] = {}
         # Aggregate client-side splits of long messages into one MessageEvent; bounds are conservative
         # for Telegram's ~1 edit/s flood envelope.
         self._text_batch_delay_seconds = self._env_float_clamped(
@@ -3318,6 +3325,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             self._media_group_tasks, self._media_group_events, self._pending_photo_batch_tasks,
             self._pending_photo_batches, self._pending_text_batch_tasks, self._pending_text_batches):
             d.clear()
+        # Album in-flight counters share the teardown path so a reconnect starts from zero
+        # instead of inheriting a stale non-zero count.
+        self._media_group_pending_counts().clear()
         self._clear_task_attrs_except(
             current_task, "_polling_error_task", "_polling_progress_verifier_task", "_held_inbound_redispatch_task")
 
@@ -6544,13 +6554,22 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         super()._enqueue_text_event(event)
         self._accept_update()
 
-    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
+    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None,
+                              wait_for: Optional[Callable[[], bool]] = None, wait_max: float = 0.0) -> None:
         """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
-        the pop but before durable dispatch re-holds the event (never lose it)."""
+        the pop but before durable dispatch re-holds the event (never lose it). ``wait_for`` (bounded by
+        ``wait_max``) keeps the window open while e.g. an album sibling's download is still in flight."""
         current_task = asyncio.current_task()
         event = None
         try:
             await asyncio.sleep(delay)
+            # Keep the window open while the caller still has in-flight siblings (album lane);
+            # bounded so one wedged item cannot wedge the flush.
+            if wait_for is not None:
+                waited = 0.0
+                while wait_for() and waited < wait_max:
+                    await asyncio.sleep(0.1)
+                    waited += 0.1
             # Superseded flush (a newer chunk re-armed the timer while our sleep was already done):
             # CancelledError only lands at the next await, so check synchronously before the pop.
             owner = tasks.get(key)
@@ -6802,37 +6821,79 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
-        # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
-        if msg.photo:
-            try:
-                file_obj = await msg.photo[-1].get_file()  # PhotoSize list sorted by size; largest last
-                image_bytes = await file_obj.download_as_bytearray()
-                ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
-                self._set_cached_media(
-                    event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
-                    "[Telegram] Cached user photo at %s")
-                await self._route_photo_event(msg, event)
-                return
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache photo: %s", _redact_telegram_error_text(e), exc_info=True)
-                await self._surface_media_cache_failure(msg, event, "photo", e)
-        # Voice/audio cached for STT transcription; video for vision.
-        if msg.voice:
-            if await self._cache_inbound_av(msg, event, msg.voice, "voice message", "voice", ".ogg", "audio/ogg"):
-                return
-        elif msg.audio:
-            if await self._cache_inbound_av(msg, event, msg.audio, "audio file", "audio", ".mp3", "audio/mp3"):
-                return
-        elif msg.video:
-            if await self._cache_inbound_av(msg, event, msg.video, "video file", "video", ".mp4", "video/mp4"):
-                return
-        elif msg.document and await self._cache_inbound_document(msg, event):
-            return
+        # Album items (a shared media_group_id) arrive as separate rapid updates, but each photo
+        # needs a network round-trip download before it can be buffered — register the arrival
+        # BEFORE the download so the debounce flush waits for every sibling instead of splitting
+        # the album into separate turns ("sent N photos, the model saw 1").
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            await self._queue_media_group_event(str(media_group_id), event)
-            return
-        await self.handle_message(event)
+            media_group_id = str(media_group_id)
+            self._note_media_group_arrival(media_group_id)
+        try:
+            # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
+            if msg.photo:
+                try:
+                    file_obj = await msg.photo[-1].get_file()  # PhotoSize list sorted by size; largest last
+                    image_bytes = await file_obj.download_as_bytearray()
+                    ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
+                    self._set_cached_media(
+                        event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
+                        "[Telegram] Cached user photo at %s")
+                    await self._route_photo_event(msg, event)
+                    return
+                except Exception as e:
+                    logger.warning("[Telegram] Failed to cache photo: %s", _redact_telegram_error_text(e), exc_info=True)
+                    await self._surface_media_cache_failure(msg, event, "photo", e)
+            # Voice/audio cached for STT transcription; video for vision.
+            if msg.voice:
+                if await self._cache_inbound_av(msg, event, msg.voice, "voice message", "voice", ".ogg", "audio/ogg"):
+                    return
+            elif msg.audio:
+                if await self._cache_inbound_av(msg, event, msg.audio, "audio file", "audio", ".mp3", "audio/mp3"):
+                    return
+            elif msg.video:
+                if await self._cache_inbound_av(msg, event, msg.video, "video file", "video", ".mp4", "video/mp4"):
+                    return
+            elif msg.document and await self._cache_inbound_document(msg, event):
+                return
+            if media_group_id:
+                await self._queue_media_group_event(media_group_id, event)
+                return
+            await self.handle_message(event)
+        finally:
+            # Every exit path above (queued, held, dispatched, dropped, or raised) releases the
+            # item's in-flight slot — a non-queuing path must not leave the flush on a phantom sibling.
+            if media_group_id:
+                self._media_group_item_finished(media_group_id)
+
+    def _media_group_pending_counts(self) -> dict[str, int]:
+        """In-flight album-item counts, created on first use (object.__new__ test doubles lack __init__ state)."""
+        counts = getattr(self, "_media_group_pending", None)
+        if counts is None:
+            counts = {}
+            self._media_group_pending = counts
+        return counts
+
+    def _reschedule_media_group_flush(self, media_group_id: str) -> None:
+        """(Re)arm the album debounce; a newer arrival/completion supersedes the pending flush."""
+        prior_task = self._media_group_tasks.get(media_group_id)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        self._media_group_tasks[media_group_id] = asyncio.create_task(self._flush_media_group_event(media_group_id))
+
+    def _note_media_group_arrival(self, media_group_id: str) -> None:
+        """Register an album item's arrival BEFORE its (slow) photo download and re-arm the debounce, so the
+        whole album reaches the model as one turn even when sibling downloads are slow or sequential."""
+        counts = self._media_group_pending_counts()
+        counts[media_group_id] = counts.get(media_group_id, 0) + 1
+        self._reschedule_media_group_flush(media_group_id)
+
+    def _media_group_item_finished(self, media_group_id: str) -> None:
+        """Release one in-flight album slot — called on EVERY exit path of the item's handler (queued,
+        held, dropped, raised), so no path can leave the flush waiting on a phantom sibling."""
+        counts = self._media_group_pending_counts()
+        if counts.get(media_group_id):
+            counts[media_group_id] -= 1
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
@@ -6842,14 +6903,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return
         self._merge_into_pending(self._media_group_events, media_group_id, event)
         self._accept_update()
-        prior_task = self._media_group_tasks.get(media_group_id)
-        if prior_task:
-            prior_task.cancel()
-        self._media_group_tasks[media_group_id] = asyncio.create_task(self._flush_media_group_event(media_group_id))
+        self._reschedule_media_group_flush(media_group_id)
 
     async def _flush_media_group_event(self, media_group_id: str) -> None:
-        await self._flush_buffered(
-            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group")
+        try:
+            await self._flush_buffered(
+                self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group",
+                wait_for=lambda: self._media_group_pending_counts().get(media_group_id, 0) > 0,
+                wait_max=self.MEDIA_GROUP_MAX_WAIT_SECONDS)
+        except asyncio.CancelledError:
+            raise  # superseded by a newer arrival/flush — it owns the counter now
+        else:
+            # Album settled (dispatched, held, or the wait cap expired): drop the counter so a
+            # wedged download cannot leak a key.
+            self._media_group_pending_counts().pop(media_group_id, None)
 
     async def _handle_sticker(self, msg: Message, event: MessageEvent) -> None:
         """Describe a sticker via vision, cached by file_unique_id; animated/video stickers get an emoji placeholder."""
